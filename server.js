@@ -13,6 +13,7 @@ const db = require("./db");
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // INISIALISASI VARIABEL
 let runningQueue = {};
@@ -25,7 +26,7 @@ counters.forEach((counter) => {
 
 // RESET ANTRIAN
 cron.schedule("0 0 * * *", () => {
-  console.log("Melakukan reset antrian tiap 2 menit...");
+  console.log("Melakukan reset antrian tiap jam 00:00...");
 
   db.query("SELECT * FROM counters", (err, results) => {
     if (err) {
@@ -117,7 +118,7 @@ app.post("/api/take", (req, res) => {
     return res.status(400).json({ error: "Counter harus disertakan" });
   }
 
-  const counterName = counter.toLowerCase();
+  const counterName = counter.toUpperCase();
 
   if (!runningQueue[counterName]) {
     return res.status(400).json({ error: "Counter tidak ditemukan" });
@@ -190,41 +191,81 @@ app.post("/api/start", (req, res) => {
   if (!token) return res.status(400).json({ error: "Token harus disertakan" });
 
   const upperToken = token.toUpperCase();
-  let found = false;
+  let counterName = null;
+  let tokenObj = null;
 
-  for (let counterName in runningQueue) {
-    const tokenObj = runningQueue[counterName].find(
-      (t) => t.token === upperToken
-    );
-    if (tokenObj) {
-      found = true;
-
-      if (activeTimers[upperToken]) {
-        return res.status(400).json({ error: "ServiceTime sudah berjalan" });
-      }
-
-      let [h, m, s] = tokenObj.serviceTime.split(":").map(Number);
-      activeTimers[upperToken] = setInterval(() => {
-        s++;
-        if (s >= 60) {
-          s = 0;
-          m++;
-        }
-        if (m >= 60) {
-          m = 0;
-          h++;
-        }
-        tokenObj.serviceTime = `${String(h).padStart(2, "0")}:${String(
-          m
-        ).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-        broadcastQueue();
-      }, 1000);
-
-      return res.json({ message: `ServiceTime token ${upperToken} dimulai` });
+  // Cari token di runningQueue
+  for (let cn in runningQueue) {
+    const t = runningQueue[cn].find((t) => t.token === upperToken);
+    if (t) {
+      counterName = cn;
+      tokenObj = t;
+      break;
     }
   }
 
-  if (!found) res.status(404).json({ error: "Token tidak ditemukan" });
+  // Kalau token nggak ada di runningQueue
+  if (!counterName || !tokenObj) {
+    return res
+      .status(404)
+      .json({ error: "Token tidak ditemukan di runningQueue" });
+  }
+
+  // Kalau timer sudah berjalan
+  if (activeTimers[upperToken]) {
+    return res.status(400).json({ error: "ServiceTime sudah berjalan" });
+  }
+
+  // Cek ke DB apakah token sudah pernah di-stop
+  db.query(
+    "SELECT id FROM counters WHERE name = ?",
+    [counterName],
+    (err, results) => {
+      if (err || results.length === 0) {
+        return res.status(404).json({ error: "Counter tidak ditemukan di DB" });
+      }
+
+      const counterId = results[0].id;
+      db.query(
+        "SELECT id FROM history WHERE token = ? AND counter_id = ?",
+        [upperToken, counterId],
+        (err, rows) => {
+          if (err) {
+            console.error("Gagal cek DB:", err);
+            return res.status(500).json({ error: "Gagal cek DB" });
+          }
+
+          if (rows.length > 0) {
+            return res.status(400).json({
+              error: `Token ${upperToken} sudah pernah di-stop sebelumnya`,
+            });
+          }
+
+          // Start timer kalau semua validasi lolos
+          let [h, m, s] = tokenObj.serviceTime.split(":").map(Number);
+          activeTimers[upperToken] = setInterval(() => {
+            s++;
+            if (s >= 60) {
+              s = 0;
+              m++;
+            }
+            if (m >= 60) {
+              m = 0;
+              h++;
+            }
+            tokenObj.serviceTime = `${String(h).padStart(2, "0")}:${String(
+              m
+            ).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+            broadcastQueue();
+          }, 1000);
+
+          return res.json({
+            message: `ServiceTime token ${upperToken} dimulai`,
+          });
+        }
+      );
+    }
+  );
 });
 
 // STOP PELAYANAN
@@ -274,6 +315,10 @@ app.post("/api/stop", (req, res) => {
           return res.status(500).json({ error: "Gagal simpan ke DB" });
         }
 
+        runningQueue[counterName] = runningQueue[counterName].filter(
+          (t) => t.token !== upperToken
+        );
+
         console.log("Data berhasil disimpan:", result);
         return res.json({
           message: `ServiceTime token ${upperToken} dihentikan & disimpan`,
@@ -284,32 +329,69 @@ app.post("/api/stop", (req, res) => {
 });
 
 // PELAYANAN SELANJUTNYA
-app.post("/next", (req, res) => {
+app.post("/api/next", (req, res) => {
   const { counter } = req.body;
   if (!counter)
     return res.status(400).json({ error: "Counter harus disertakan" });
 
-  const counterName = req.params.counter.toLowerCase();
+  const counterName = counter.toUpperCase();
 
   if (!runningQueue[counterName] || runningQueue[counterName].length === 0) {
     return res.status(400).json({ error: "Tidak ada token di antrian" });
   }
 
-  const currentToken = runningQueue[counterName].shift();
+  const currentToken = runningQueue[counterName][0];
 
   if (activeTimers[currentToken.token]) {
     clearInterval(activeTimers[currentToken.token]);
     delete activeTimers[currentToken.token];
   }
 
-  broadcastQueue();
+  console.log("Isi runningQueue:", runningQueue);
+  console.log("CounterName:", counterName);
 
-  res.json({
-    message: `Token ${
-      currentToken.token
-    } selesai dan dihapus dari counter ${counterName.toUpperCase()}`,
-    token: currentToken,
-  });
+  // ini buat ngambil counter_id dari si db nya
+  db.query(
+    "SELECT id FROM counters WHERE name = ?",
+    [counterName],
+    (err, results) => {
+      if (err || results.length === 0) {
+        return res.status(404).json({ error: "Counter tidak ditemukan di DB" });
+      }
+
+      const counterId = results[0].id;
+      const today = new Date().toISOString().split("T")[0];
+
+      // buat ngecek token hari ini
+      db.query(
+        "SELECT id FROM history WHERE token = ? AND counter_id = ? AND DATE(created_at) = ?",
+        [currentToken.token, counterId, today],
+        (err, rows) => {
+          if (err) {
+            console.error("DB error:", err);
+            return res.status(500).json({ error: "Gagal cek history" });
+          }
+
+          if (rows.length > 0) {
+            runningQueue[counterName].shift();
+            console.log(`Token ${currentToken.token} sudah dilayani hari ini`);
+            console.log("Isi runningQueue:", runningQueue);
+          } else {
+            const tokenDipindah = runningQueue[counterName].shift();
+            runningQueue[counterName].push(tokenDipindah);
+            console.log(
+              `Token ${currentToken.token} dipindahkan ke belakang queue`
+            );
+            console.log("Isi runningQueue:", runningQueue);
+          }
+          broadcastQueue();
+          return res.json({
+            message: `Next diproses untuk ${currentToken.token}`,
+          });
+        }
+      );
+    }
+  );
 });
 
 // MONITOR WEBSOCKET
