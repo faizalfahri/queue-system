@@ -9,6 +9,9 @@ const PDFDocument = require("pdfkit");
 const path = require("path");
 
 const db = require("./db");
+const jwt = require("jsonwebtoken");
+const { generateToken, verifyToken } = require("./auth");
+require("dotenv").config();
 
 const app = express();
 app.use(cors());
@@ -18,10 +21,36 @@ app.use(express.urlencoded({ extended: true }));
 // INISIALISASI VARIABEL
 let runningQueue = {};
 let noToken = {};
-let counters = [];
-counters.forEach((counter) => {
-  runningQueue[counter.name] = [];
-  noToken[counter.name] = 1;
+
+// LOGIN
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username & password wajib diisi" });
+  }
+
+  db.query(
+    "SELECT * FROM users WHERE username = ?",
+    [username],
+    async (err, results) => {
+      if (err) return res.status(500).json({ error: "DB error" });
+      if (results.length === 0) {
+        return res.status(401).json({ error: "User tidak ditemukan" });
+      }
+
+      const user = results[0];
+
+      // cek password yg dimasukin vs password hash di DB
+      const validPassword = await bcrypt.compare(password, user.password);
+      if (!validPassword) {
+        return res.status(401).json({ error: "Password salah" });
+      }
+
+      const token = generateToken({ id: user.id, username: user.username });
+      res.json({ token });
+    }
+  );
 });
 
 // RESET ANTRIAN
@@ -50,8 +79,8 @@ cron.schedule("0 0 * * *", () => {
 });
 
 // INISIALISASI SERVER
-const server = app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+const server = app.listen(process.env.PORT, () => {
+  console.log(`Server running on ${process.env.PORT}`);
 });
 
 // INISIALISASI WEBSOCKET
@@ -204,7 +233,7 @@ app.post("/api/start", (req, res) => {
     }
   }
 
-  // Kalau token nggak ada di runningQueue
+  // Kalau token gada di runningQueue
   if (!counterName || !tokenObj) {
     return res
       .status(404)
