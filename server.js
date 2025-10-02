@@ -8,6 +8,7 @@ const fs = require("fs");
 const PDFDocument = require("pdfkit");
 const path = require("path");
 
+const bcrypt = require("bcrypt");
 const db = require("./db");
 const jwt = require("jsonwebtoken");
 const { generateToken, verifyToken } = require("./auth");
@@ -21,6 +22,45 @@ app.use(express.urlencoded({ extended: true }));
 // INISIALISASI VARIABEL
 let runningQueue = {};
 let noToken = {};
+const SECRET_KEY = process.env.JWT_SECRET;
+
+// REGISTER
+app.post("/api/register", async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Username dan password wajib diisi" });
+  }
+
+  try {
+    db.query(
+      "SELECT * FROM users WHERE username = ?",
+      [username],
+      async (err, results) => {
+        if (err) return res.status(500).json({ error: "DB error" });
+        if (results.length > 0) {
+          return res.status(400).json({ error: "Username sudah dipakai" });
+        }
+
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        db.query(
+          "INSERT INTO users (username, password) VALUES (?, ?)",
+          [username, hashedPassword],
+          (err, result) => {
+            if (err)
+              return res.status(500).json({ error: "Gagal simpan user" });
+            res.json({ message: "User berhasil didaftarkan!" });
+          }
+        );
+      }
+    );
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // LOGIN
 app.post("/api/login", (req, res) => {
@@ -40,17 +80,29 @@ app.post("/api/login", (req, res) => {
       }
 
       const user = results[0];
-
-      // cek password yg dimasukin vs password hash di DB
       const validPassword = await bcrypt.compare(password, user.password);
+
       if (!validPassword) {
         return res.status(401).json({ error: "Password salah" });
       }
 
-      const token = generateToken({ id: user.id, username: user.username });
-      res.json({ token });
+      const token = generateToken(
+        { id: user.id, username: user.username },
+        SECRET_KEY,
+        { expiresIn: "1h" }
+      );
+      res.json({ message: "Login berhasil", token });
     }
   );
+});
+
+// endpoint verif token
+app.post("/api/protected", verifyToken, (req, res) => {
+  res.json({
+    message: "Akses berhasil via POST!",
+    user: req.user,
+    data: req.body,
+  });
 });
 
 // RESET ANTRIAN
